@@ -80,6 +80,43 @@ def init_db():
           reason TEXT NOT NULL,
           status TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS tombstones(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          old_key TEXT UNIQUE NOT NULL,
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL,
+          ledger_version TEXT NOT NULL,
+          ledger_new_key TEXT NOT NULL,
+          attempts INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS refuse_audit(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          old_key TEXT NOT NULL,
+          version TEXT NOT NULL,
+          target_key TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          status TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS key_locks(
+          old_key TEXT PRIMARY KEY,
+          holder TEXT NOT NULL,
+          acquired_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS key_contention(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          old_key TEXT NOT NULL,
+          holder TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tombstone_deviation(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          old_key TEXT NOT NULL,
+          detail TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
         """)
         if conn.execute("SELECT COUNT(*) c FROM map_versions").fetchone()["c"] == 0:
             conn.execute("INSERT INTO map_versions(version,status,effective_from) VALUES (?,?,?)", ("m-2026.11","生效","2026-11-01"))
@@ -123,22 +160,109 @@ def mappings(authorization: str | None = Header(default=None)):
 
 class RemapIn(BaseModel):
     old_key: str
+    force: bool = False
+    mode: str = "禁写"
+
+class TombstoneIn(BaseModel):
+    old_key: str
+    reason: str = "旧键废弃"
+
+# 墓碑修复册封册口径：甲路径（禁写），乙路径（改键审计）不采用。
+REPAIR_BOOK = {"mode": "禁写", "on_tombstone": "整笔拒绝+正式零改+拒映审计"}
+
+def _deviation(c, old_key: str, detail: str, now: str) -> None:
+    c.execute("INSERT INTO tombstone_deviation(old_key,detail,created_at) VALUES (?,?,?)",
+              (old_key, detail, now))
+    c.commit()
+
+def require_admin(authorization: str | None) -> str:
+    u = require_user(authorization)
+    with connect() as c:
+        row = c.execute("SELECT role FROM users WHERE username=?", (u,)).fetchone()
+    if not row or row["role"] != "管理员":
+        raise HTTPException(403, "仅管理员可写墓碑")
+    return u
+
+def _acquire_key_lock(c, old_key: str, holder: str, user: str, now: str) -> None:
+    """占旧键锁：锁行先提交以便并发方可见；后到者只记争用，不再写正式区或墓碑。"""
+    try:
+        c.execute("INSERT INTO key_locks(old_key,holder,acquired_at) VALUES (?,?,?)",
+                  (old_key, holder, now))
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.rollback()
+        c.execute("INSERT INTO key_contention(old_key,holder,reason,created_at) VALUES (?,?,?,?)",
+                  (old_key, user, "旧键锁被占，争用", now))
+        c.commit()
+        raise HTTPException(409, "旧键已被占用，争用已记录")
+
+def _release_key_lock(c, old_key: str, holder: str) -> None:
+    c.execute("DELETE FROM key_locks WHERE old_key=? AND holder=?", (old_key, holder))
+    c.commit()
 
 @app.post("/api/remap")
 def remap(body: RemapIn, authorization: str | None = Header(default=None)):
-    require_user(authorization)
+    user = require_user(authorization)
+    holder = secrets.token_hex(8)
+    now = datetime.now().isoformat(timespec="seconds")
+    with connect() as c:
+        ver = c.execute("SELECT version FROM map_versions WHERE status='生效' ORDER BY id DESC LIMIT 1").fetchone()
+        if not ver: raise HTTPException(404, "无生效映射版本")
+
+        # 偏离修复册：force 或非禁写口径，一律拒写并记「墓碑偏了」。
+        if body.force or body.mode != REPAIR_BOOK["mode"]:
+            _deviation(c, body.old_key, f"偏离修复册：force={body.force} mode={body.mode}", now)
+            raise HTTPException(409, "墓碑偏了：偏离修复册口径，拒写")
+
+        _acquire_key_lock(c, body.old_key, holder, user, now)
+        try:
+            # 甲路径（禁写）：旧键已墓碑只读 → 重映整笔拒绝，正式零改，写拒映审计。
+            tomb = c.execute("SELECT * FROM tombstones WHERE old_key=? AND status='只读'",
+                             (body.old_key,)).fetchone()
+            if tomb:
+                c.execute("UPDATE tombstones SET attempts=attempts+1 WHERE old_key=?", (body.old_key,))
+                c.execute(
+                    "INSERT INTO refuse_audit(old_key,version,target_key,reason,status,created_at) VALUES (?,?,?,?,?,?)",
+                    (body.old_key, ver["version"], tomb["ledger_new_key"], "墓碑旧键只读，重映拒映", "拒映", now))
+                c.commit()
+                raise HTTPException(409, "墓碑旧键只读，重映拒映")
+
+            m = c.execute("SELECT * FROM mappings WHERE version=? AND old_key=?", (ver["version"], body.old_key)).fetchone()
+            if not m:
+                c.execute("INSERT INTO conflicts(old_key,reason,status) VALUES (?,?,?)", (body.old_key, "无映射", "挂起"))
+                c.commit()
+                raise HTTPException(409, "无映射，已进冲突队列")
+            c.execute("INSERT INTO formal_entities(entity_key,mapped_from,version,created_at) VALUES (?,?,?,?)",
+                      (m["new_key"], body.old_key, ver["version"], now))
+            c.commit()
+            return {"entity_key": m["new_key"], "version": ver["version"]}
+        finally:
+            _release_key_lock(c, body.old_key, holder)
+
+@app.post("/api/tombstones")
+def create_tombstone(body: TombstoneIn, authorization: str | None = Header(default=None)):
+    user = require_admin(authorization)
+    holder = secrets.token_hex(8)
     now = datetime.now().isoformat(timespec="seconds")
     with connect() as c:
         ver = c.execute("SELECT version FROM map_versions WHERE status='生效' ORDER BY id DESC LIMIT 1").fetchone()
         if not ver: raise HTTPException(404, "无生效映射版本")
         m = c.execute("SELECT * FROM mappings WHERE version=? AND old_key=?", (ver["version"], body.old_key)).fetchone()
-        if not m:
-            c.execute("INSERT INTO conflicts(old_key,reason,status) VALUES (?,?,?)", (body.old_key, "无映射", "挂起"))
+        if not m: raise HTTPException(409, "无映射，不能立墓碑")
+
+        _acquire_key_lock(c, body.old_key, holder, user, now)
+        try:
+            exists = c.execute("SELECT 1 FROM tombstones WHERE old_key=?", (body.old_key,)).fetchone()
+            if exists:
+                raise HTTPException(409, "旧键已有墓碑")
+            c.execute(
+                "INSERT INTO tombstones(old_key,reason,status,ledger_version,ledger_new_key,attempts,created_at)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (body.old_key, body.reason, "只读", ver["version"], m["new_key"], 0, now))
             c.commit()
-            raise HTTPException(409, "无映射，已进冲突队列")
-        c.execute("INSERT INTO formal_entities(entity_key,mapped_from,version,created_at) VALUES (?,?,?,?)",
-                  (m["new_key"], body.old_key, ver["version"], now))
-        return {"entity_key": m["new_key"], "version": ver["version"]}
+            return {"old_key": body.old_key, "status": "只读", "ledger_new_key": m["new_key"]}
+        finally:
+            _release_key_lock(c, body.old_key, holder)
 
 @app.get("/api/formal")
 def formal(authorization: str | None = Header(default=None)):
@@ -151,6 +275,55 @@ def conflicts(authorization: str | None = Header(default=None)):
     require_user(authorization)
     with connect() as c:
         return {"items":[dict(r) for r in c.execute("SELECT * FROM conflicts ORDER BY id DESC").fetchall()]}
+
+@app.get("/api/tombstones")
+def tombstones(authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    with connect() as c:
+        return {"items":[dict(r) for r in c.execute("SELECT * FROM tombstones ORDER BY id DESC").fetchall()]}
+
+@app.get("/api/refuse-audit")
+def refuse_audit(authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    with connect() as c:
+        return {"items":[dict(r) for r in c.execute("SELECT * FROM refuse_audit ORDER BY id DESC").fetchall()]}
+
+@app.get("/api/contention")
+def contention(authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    with connect() as c:
+        return {"items":[dict(r) for r in c.execute("SELECT * FROM key_contention ORDER BY id DESC").fetchall()]}
+
+@app.get("/api/cross-check")
+def cross_check(authorization: str | None = Header(default=None)):
+    """互证页：墓碑 / 正式实体 / 拒映审计 / 映射册 五处同态核对。"""
+    require_user(authorization)
+    items = []
+    with connect() as c:
+        tombs = c.execute("SELECT * FROM tombstones ORDER BY id").fetchall()
+        for t in tombs:
+            old_key = t["old_key"]
+            formal_hits = c.execute(
+                "SELECT COUNT(*) n FROM formal_entities WHERE mapped_from=?", (old_key,)).fetchone()["n"]
+            mappings = c.execute("SELECT new_key FROM mappings WHERE old_key=?", (old_key,)).fetchall()
+            mapping_keys = {m["new_key"] for m in mappings}
+            audits = c.execute(
+                "SELECT * FROM refuse_audit WHERE old_key=? ORDER BY id DESC", (old_key,)).fetchall()
+            audit = audits[0] if audits else None
+            ledger_ok = t["ledger_new_key"] in mapping_keys
+            audit_ok = bool(audit) and audit["version"] == t["ledger_version"] and audit["target_key"] == t["ledger_new_key"]
+            consistent = t["status"] == "只读" and formal_hits == 0 and ledger_ok and audit_ok
+            items.append({
+                "old_key": old_key,
+                "status": t["status"],
+                "ledger_new_key": t["ledger_new_key"],
+                "formal_leak": formal_hits,
+                "ledger_consistent": ledger_ok,
+                "audit_status": audit["status"] if audit else None,
+                "audit_consistent": audit_ok,
+                "consistent": consistent,
+            })
+    return {"ok": all(i["consistent"] for i in items), "repair_book": REPAIR_BOOK, "items": items}
 
 @app.get("/")
 def index():

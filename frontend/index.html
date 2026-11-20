@@ -53,6 +53,7 @@ createApp({
     const username=ref('admin'), password=ref('123456'), err=ref(''), actionErr=ref('');
     const leftTab=ref(0), rightTab=ref(0);
     const versions=ref([]), mappings=ref([]), formal=ref([]), conflicts=ref([]);
+    const tombstones=ref([]), refuseAudit=ref([]), contentionRows=ref([]), crossCheck=ref({ok:null,items:[]});
     const oldKey=ref('OLD-B1');
     function auth(){return {Authorization:'Bearer '+token.value,'Content-Type':'application/json'};}
     async function login(){
@@ -80,6 +81,14 @@ createApp({
       formal.value=Array.isArray(f.items)?f.items:[];
       const c=await loadJson('/api/conflicts'); if(c===null) return;
       conflicts.value=Array.isArray(c.items)?c.items:[];
+      const t=await loadJson('/api/tombstones');
+      tombstones.value=t&&Array.isArray(t.items)?t.items:[];
+      const ra=await loadJson('/api/refuse-audit');
+      refuseAudit.value=ra&&Array.isArray(ra.items)?ra.items:[];
+      const cc=await loadJson('/api/contention');
+      contentionRows.value=cc&&Array.isArray(cc.items)?cc.items:[];
+      const x=await loadJson('/api/cross-check');
+      crossCheck.value=x&&Array.isArray(x.items)?x:{ok:null,items:[]};
     }
     async function doRemap(){
       actionErr.value='';
@@ -88,7 +97,7 @@ createApp({
       await refresh();
     }
     onMounted(()=>{if(token.value)refresh();});
-    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,oldKey,login,logout,doRemap};
+    return {token,user,username,password,err,actionErr,leftTab,rightTab,versions,mappings,formal,conflicts,tombstones,refuseAudit,contentionRows,crossCheck,oldKey,login,logout,doRemap};
   },
   template:`
   <div v-if="!token" class="login">
@@ -129,6 +138,7 @@ createApp({
         <div class="tabs">
           <button :class="{on:rightTab===0}" @click="rightTab=0">正式区</button>
           <button :class="{on:rightTab===1}" @click="rightTab=1">冲突队列</button>
+          <button :class="{on:rightTab===2}" @click="rightTab=2">墓碑互证</button>
         </div>
         <div class="box" v-show="rightTab===0">
           <h2>Formal Zone</h2>
@@ -139,6 +149,26 @@ createApp({
           <h2>Conflicts</h2>
           <table><thead><tr><th>old</th><th>reason</th><th>status</th></tr></thead>
           <tbody><tr v-for="c in conflicts" :key="c.id"><td class="bad">{{c.old_key}}</td><td>{{c.reason}}</td><td>{{c.status}}</td></tr></tbody></table>
+        </div>
+        <div class="box" v-show="rightTab===2">
+          <h2>Tombstone Cross-Check <span class="pill" :class="crossCheck.ok?'ok':'bad'">{{crossCheck.ok===null?'未核对':(crossCheck.ok?'五处同态':'同态破裂')}}</span></h2>
+          <table><thead><tr><th>old</th><th>status</th><th>正式泄漏</th><th>映射册</th><th>拒映审计</th><th>同态</th></tr></thead>
+          <tbody><tr v-for="t in crossCheck.items" :key="t.old_key">
+            <td>{{t.old_key}}</td><td>{{t.status}}</td>
+            <td :class="t.formal_leak?'bad':'ok'">{{t.formal_leak}}</td>
+            <td :class="t.ledger_consistent?'ok':'bad'">{{t.ledger_consistent?'一致':'不一致'}}</td>
+            <td :class="t.audit_consistent?'ok':'bad'">{{t.audit_status||'无'}}</td>
+            <td :class="t.consistent?'ok':'bad'">{{t.consistent?'同态':'破裂'}}</td>
+          </tr></tbody></table>
+          <h2 style="margin-top:14px">Tombstones</h2>
+          <table><thead><tr><th>old</th><th>reason</th><th>status</th><th>target</th><th>attempts</th></tr></thead>
+          <tbody><tr v-for="t in tombstones" :key="t.id"><td>{{t.old_key}}</td><td>{{t.reason}}</td><td>{{t.status}}</td><td>{{t.ledger_new_key}}</td><td>{{t.attempts}}</td></tr></tbody></table>
+          <h2 style="margin-top:14px">Refuse Audit</h2>
+          <table><thead><tr><th>old</th><th>version</th><th>target</th><th>reason</th><th>status</th><th>at</th></tr></thead>
+          <tbody><tr v-for="a in refuseAudit" :key="a.id"><td>{{a.old_key}}</td><td>{{a.version}}</td><td>{{a.target_key}}</td><td>{{a.reason}}</td><td class="bad">{{a.status}}</td><td>{{a.created_at}}</td></tr></tbody></table>
+          <h2 style="margin-top:14px">Contention</h2>
+          <table><thead><tr><th>old</th><th>holder</th><th>reason</th><th>at</th></tr></thead>
+          <tbody><tr v-for="k in contentionRows" :key="k.id"><td>{{k.old_key}}</td><td>{{k.holder}}</td><td>{{k.reason}}</td><td>{{k.created_at}}</td></tr></tbody></table>
         </div>
       </div>
     </div>
